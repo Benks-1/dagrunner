@@ -1,0 +1,12 @@
+[project]
+name = "dagrunner"
+version = "0.1.0"
+description = "Lightweight local DAG runner"
+readme = "README.md"
+
+[project.scripts]
+dag = "dagrunner:main"
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
