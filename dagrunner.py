@@ -45,29 +45,111 @@ def run_script(path, interpreter):
 
 
 def run_function(path, args=None, kwargs=None):
-    module_name, func_name = path.rsplit('.', 1)
-    cwd = str(Path.cwd())
-    if cwd not in sys.path:
-        sys.path.insert(0, cwd)
 
-    mod = importlib.import_module(module_name)
-    func = getattr(mod, func_name)
-
-    stdout_io = io.StringIO()
-    stderr_io = io.StringIO()
-
+    project_dir = Path.cwd()
     args = args or []
     kwargs = kwargs or {}
 
-    with redirect_stdout(stdout_io), redirect_stderr(stderr_io):
-        result = func(*args, **kwargs)
+    # 1) Prefer an explicit override if you later decide to set it in the parent (optional)
+    interp = os.environ.get("DAGRUNNER_INTERPRETER")
+
+    # 2) Otherwise, discover a venv-like interpreter under the project (no hardcoded names)
+    def _discover():
+        candidates = []
+        for name in ("python.exe", "python"):
+            for p in project_dir.rglob(name):
+                # typical venv layout
+                if p.parent.name in ("Scripts", "bin"):
+                    # prefer ones that look like a real venv: has pyvenv.cfg two levels up
+                    venv_root = p.parent.parent
+                    score = 1
+                    if (venv_root / "pyvenv.cfg").exists():
+                        score = 0  # better
+                    candidates.append((score, p))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda x: x[0])
+        return str(candidates[0][1])
+
+    if not interp:
+        found = _discover()
+        if not found:
+            # Fallback: use this process's interpreter (may still work if deps are available)
+            found = sys.executable
+        interp = found
+
+    # 3) Build a tiny launcher that imports and calls the function
+    launcher = r"""
+import importlib, json, sys, traceback
+mod_name, func_name = "{mod_func}".rsplit(".", 1)
+try:
+    mod = importlib.import_module(mod_name)
+    func = getattr(mod, func_name)
+    a = json.loads(sys.argv[1])
+    k = json.loads(sys.argv[2])
+    rv = func(*a, **k)
+    try:
+        print("<<RETURN_VALUE_JSON>>" + json.dumps(rv, default=str))
+    except Exception:
+        print("<<RETURN_VALUE_JSON>>" + json.dumps(str(rv)))
+except Exception:
+    traceback.print_exc()
+    sys.exit(1)
+""".replace("{mod_func}", path)
+
+    # 4) Run under the discovered interpreter with CWD = project root
+    proc = subprocess.run(
+        [interp, "-c", launcher, json.dumps(args), json.dumps(kwargs)],
+        cwd=str(project_dir),
+        text=True,
+        capture_output=True,
+        env=_venv_env_for(interp)
+    )
+
+    # 5) Shape the result like your original contract
+    if proc.returncode != 0:
+        return {
+            "stdout": proc.stdout,
+            "stderr": proc.stderr,
+            "return_value": None,
+            "returncode": proc.returncode
+        }
+
+    stdout = proc.stdout or ""
+    ret_val = None
+    marker = "<<RETURN_VALUE_JSON>>"
+    if marker in stdout:
+        i = stdout.rfind(marker)
+        payload = stdout[i+len(marker):].strip()
+        stdout = stdout[:i]
+        try:
+            ret_val = json.loads(payload)
+        except Exception:
+            ret_val = payload  # fallback to raw string
 
     return {
-        "stdout": stdout_io.getvalue(),
-        "stderr": stderr_io.getvalue(),
-        "return_value": result,
+        "stdout": stdout,
+        "stderr": proc.stderr or "",
+        "return_value": ret_val,
         "returncode": 0
     }
+
+
+def _venv_env_for(interpreter_path: str):
+    """
+    Minimal env shim so console scripts/DLLs resolve like in normal venv runs.
+    Safe no-op if 'interpreter_path' isn't a venv layout.
+    """
+    env = os.environ.copy()
+    ip = Path(interpreter_path)
+    scripts = ip.parent                      # .../Scripts or .../bin
+    venv_root = scripts.parent
+    # If it looks like a venv, set a couple of niceties
+    if scripts.name in ("Scripts", "bin"):
+        env["PATH"] = str(scripts) + os.pathsep + env.get("PATH", "")
+        env["VIRTUAL_ENV"] = str(venv_root)
+        env.pop("PYTHONHOME", None)
+    return env
 
 
 def run_task(task, interpreter, logf, dry_run=False):
