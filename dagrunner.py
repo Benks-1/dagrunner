@@ -7,6 +7,7 @@ import time
 import multiprocessing
 from pathlib import Path
 from datetime import datetime
+import platform, shutil
 
 LOG_DIR = Path.cwd()
 
@@ -41,43 +42,26 @@ def run_script(path, interpreter):
     return subprocess.run([str(interpreter), str(path)], capture_output=True, text=True)
 
 
-def run_function(path, args=None, kwargs=None):
+def run_function(path, args=None, kwargs=None, interpreter: Path | None = None, project_dir: Path | None = None):
+    """
+    Execute module.function(*args, **kwargs) in a subprocess using the provided interpreter,
+    with cwd=project_dir (defaults to Path.cwd()).
+    """
+    import json, subprocess, sys, io, importlib
+    from contextlib import redirect_stdout, redirect_stderr
 
-    project_dir = Path.cwd()
+    project_dir = project_dir or Path.cwd()
     args = args or []
-    kwargs = kwargs or {}
+    kwargs = kwargs or []
+    if isinstance(kwargs, list):  # guard if someone passed a list by mistake
+        kwargs = {}
 
-    # 1) Prefer an explicit override if you later decide to set it in the parent (optional)
-    interp = os.environ.get("DAGRUNNER_INTERPRETER")
+    if interpreter is None:
+        interpreter = _ensure_real_python(None, project_dir)
 
-    # 2) Otherwise, discover a venv-like interpreter under the project (no hardcoded names)
-    def _discover():
-        candidates = []
-        for name in ("python.exe", "python"):
-            for p in project_dir.rglob(name):
-                # typical venv layout
-                if p.parent.name in ("Scripts", "bin"):
-                    # prefer ones that look like a real venv: has pyvenv.cfg two levels up
-                    venv_root = p.parent.parent
-                    score = 1
-                    if (venv_root / "pyvenv.cfg").exists():
-                        score = 0  # better
-                    candidates.append((score, p))
-        if not candidates:
-            return None
-        candidates.sort(key=lambda x: x[0])
-        return str(candidates[0][1])
-
-    if not interp:
-        found = _discover()
-        if not found:
-            # Fallback: use this process's interpreter (may still work if deps are available)
-            found = sys.executable
-        interp = found
-
-    # 3) Build a tiny launcher that imports and calls the function
     launcher = r"""
-import importlib, json, sys, traceback
+import importlib, json, sys, traceback, os
+sys.path.insert(0, os.getcwd())
 mod_name, func_name = "{mod_func}".rsplit(".", 1)
 try:
     mod = importlib.import_module(mod_name)
@@ -94,23 +78,15 @@ except Exception:
     sys.exit(1)
 """.replace("{mod_func}", path)
 
-    # 4) Run under the discovered interpreter with CWD = project root
     proc = subprocess.run(
-        [interp, "-c", launcher, json.dumps(args), json.dumps(kwargs)],
+        [str(interpreter), "-c", launcher, json.dumps(args), json.dumps(kwargs)],
         cwd=str(project_dir),
         text=True,
-        capture_output=True,
-        env=_venv_env_for(interp)
+        capture_output=True
     )
 
-    # 5) Shape the result like your original contract
     if proc.returncode != 0:
-        return {
-            "stdout": proc.stdout,
-            "stderr": proc.stderr,
-            "return_value": None,
-            "returncode": proc.returncode
-        }
+        return {"stdout": proc.stdout, "stderr": proc.stderr, "return_value": None, "returncode": proc.returncode}
 
     stdout = proc.stdout or ""
     ret_val = None
@@ -122,14 +98,10 @@ except Exception:
         try:
             ret_val = json.loads(payload)
         except Exception:
-            ret_val = payload  # fallback to raw string
+            ret_val = payload
 
-    return {
-        "stdout": stdout,
-        "stderr": proc.stderr or "",
-        "return_value": ret_val,
-        "returncode": 0
-    }
+    return {"stdout": stdout, "stderr": proc.stderr or "", "return_value": ret_val, "returncode": 0}
+
 
 
 def _venv_env_for(interpreter_path: str):
@@ -152,7 +124,9 @@ def _venv_env_for(interpreter_path: str):
 def run_task(task, interpreter, logf, dry_run=False):
     task_id = task["id"]
     task_type = task["type"]
+    project_dir = Path.cwd()  # after A., this is the folder with dagrunner.json
     logf.write(f"\n--- Task {task_id} ---\n")
+
     start = time.time()
     try:
         if dry_run:
@@ -160,13 +134,19 @@ def run_task(task, interpreter, logf, dry_run=False):
             return
 
         if task_type == "shell":
-            result = run_shell(task["command"])
+            result = run_shell(task["command"])  # ok; runs in project_dir due to cwd
+
         elif task_type == "script":
-            result = run_script(task["path"], interpreter)
+            real_py = _ensure_real_python(interpreter, project_dir)
+            script_path = (project_dir / task["path"]).resolve()
+            result = run_script(script_path, real_py)
+
         elif task_type == "function":
+            real_py = _ensure_real_python(interpreter, project_dir)
             args = task.get("args", [])
             kwargs = task.get("kwargs", {})
-            result = run_function(task["path"], args=args, kwargs=kwargs)
+            result = run_function(task["path"], args=args, kwargs=kwargs, interpreter=real_py, project_dir=project_dir)
+
         else:
             raise ValueError(f"Unknown task type: {task_type}")
 
@@ -245,8 +225,60 @@ def validate_config(config):
 
 
 def load_config():
-    with open("dagrunner.json") as f:
+    # Find dagrunner.json from CWD upward; then treat its folder as project root
+    here = Path.cwd().resolve()
+    cfg_path = None
+    for p in [here] + list(here.parents):
+        cand = p / "dagrunner.json"
+        if cand.exists():
+            cfg_path = cand
+            os.chdir(p)  # <- make the project root the working directory
+            break
+    if cfg_path is None:
+        raise FileNotFoundError("dagrunner.json not found in current directory or any parent")
+
+    with open(cfg_path) as f:
         return json.load(f)
+
+def _is_windows():
+    return platform.system().lower().startswith("win")
+
+def _find_project_python(project_dir: Path) -> Path | None:
+    for name in ("python.exe", "python"):
+        for p in project_dir.rglob(name):
+            if p.parent.name in ("Scripts", "bin"):
+                return p
+    return None
+
+def _fallback_system_python() -> Path | None:
+    if _is_windows():
+        try:
+            out = subprocess.check_output(
+                ["py", "-3", "-c", "import sys;print(sys.executable)"],
+                text=True
+            ).strip()
+            if out and "python" in Path(out).name.lower():
+                return Path(out)
+        except Exception:
+            pass
+    for name in ("python", "python3"):
+        exe = shutil.which(name)
+        if exe:
+            return Path(exe)
+    return None
+
+def _ensure_real_python(interpreter: Path | str | None, project_dir: Path) -> Path:
+    if interpreter:
+        ip = Path(interpreter)
+        if "python" in ip.name.lower():
+            return ip
+    py = _find_project_python(project_dir) or _fallback_system_python()
+    if py:
+        return py
+    cur = Path(sys.executable)
+    if "python" in cur.name.lower():
+        return cur
+    raise RuntimeError("No suitable Python interpreter found (avoid using dagrunner.exe).")
 
 
 def init_config():
