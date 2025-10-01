@@ -8,8 +8,150 @@ import multiprocessing
 from pathlib import Path
 from datetime import datetime
 import platform, shutil
+import fnmatch
+from typing import Iterable, Sequence, Set, Dict, Any
+import difflib
+
 
 LOG_DIR = Path.cwd()
+
+
+def _index_tasks(tasks: Sequence[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    return {t["id"]: t for t in tasks}
+
+
+def _normalize_id_list(values: Iterable[str] | None) -> list[str]:
+    if not values:
+        return []
+    out: list[str] = []
+    for v in values:
+        if v is None:
+            continue
+        # Support comma-separated & repeats: -t a,b -t c
+        parts = [p.strip() for p in str(v).split(",") if p.strip()]
+        out.extend(parts)
+    return out
+
+
+def _fnmatch_any(name: str, patterns: Sequence[str]) -> bool:
+    return any(fnmatch.fnmatch(name, pat) for pat in patterns)
+
+
+def _select_task_ids(
+    all_ids: Sequence[str],
+    include_ids: Sequence[str],
+    include_globs: Sequence[str],
+    exclude_ids: Sequence[str],
+    exclude_globs: Sequence[str],
+) -> Set[str]:
+    ids = set(all_ids)
+
+    if include_ids or include_globs:
+        inc: Set[str] = set()
+        if include_ids:
+            inc.update([i for i in include_ids if i in ids])
+        if include_globs:
+            inc.update([i for i in all_ids if _fnmatch_any(i, include_globs)])
+        selected = inc
+    else:
+        selected = set(ids)
+
+    # Exclusions
+    if exclude_ids:
+        selected.difference_update(exclude_ids)
+    if exclude_globs:
+        selected = {i for i in selected if not _fnmatch_any(i, exclude_globs)}
+
+    return selected
+
+
+def _dependency_closure(start_ids: Set[str], task_map: Dict[str, Dict[str, Any]]) -> Set[str]:
+    """
+    Given a set of task ids, include all their transitive dependencies.
+    Unknown deps raise a clear error with suggestions.
+    """
+    result = set()
+    stack = list(start_ids)
+
+    while stack:
+        tid = stack.pop()
+        if tid in result:
+            continue
+        if tid not in task_map:
+            # Suggest closest names
+            choices = list(task_map.keys())
+            hint = difflib.get_close_matches(tid, choices, n=5)
+            msg = f"Task '{tid}' not found. Did you mean: {', '.join(hint) if hint else 'no close matches'}"
+            raise KeyError(msg)
+        result.add(tid)
+        for dep in task_map[tid].get("depends_on", []) or []:
+            stack.append(dep)
+
+    return result
+
+
+def _filter_config_by_args(config: Dict[str, Any], args) -> Dict[str, Any]:
+    """
+    Returns a new config dict filtered by --job/--task/--glob/--exclude-* flags.
+    This function *always* includes dependencies unless --no-deps is given.
+    """
+    jobs = config.get("jobs", {})
+    if not jobs:
+        return config
+
+    # 1) Filter jobs
+    job_ids = list(jobs.keys())
+    selected_jobs = job_ids
+    if getattr(args, "jobs", None):
+        requested = _normalize_id_list(args.jobs)
+        unknown = [j for j in requested if j not in jobs]
+        if unknown:
+            hint = difflib.get_close_matches(unknown[0], job_ids, n=5)
+            raise SystemExit(f"Unknown job: {unknown[0]}. Did you mean: {', '.join(hint) if hint else 'no close matches'}")
+        selected_jobs = requested
+
+    # Gather task filters
+    include_tasks = _normalize_id_list(getattr(args, "tasks", None))
+    include_task_globs = _normalize_id_list(getattr(args, "task_globs", None))
+    exclude_tasks = _normalize_id_list(getattr(args, "exclude_tasks", None))
+    exclude_task_globs = _normalize_id_list(getattr(args, "exclude_task_globs", None))
+    with_deps = not getattr(args, "no_deps", False)
+
+    new_jobs: Dict[str, Any] = {}
+    for jid in selected_jobs:
+        job = jobs[jid]
+        tasks = job.get("tasks", [])
+        if not tasks:
+            continue
+        task_ids = [t["id"] for t in tasks]
+        task_map = _index_tasks(tasks)
+
+        # 2) Select tasks
+        selected_task_ids = _select_task_ids(
+            task_ids,
+            include_tasks,
+            include_task_globs,
+            exclude_tasks,
+            exclude_task_globs,
+        )
+
+        # 3) Include dependencies if requested (default)
+        if with_deps and selected_task_ids:
+            selected_task_ids = _dependency_closure(selected_task_ids, task_map)
+
+        # 4) Keep order, filter to chosen set
+        filtered_tasks = [t for t in tasks if t["id"] in selected_task_ids]
+
+        if include_tasks or include_task_globs:
+            if not filtered_tasks:
+                raise SystemExit(
+                    f"No tasks matched selection in job '{jid}'. "
+                    f"Requested IDs: {include_tasks or '[]'}, globs: {include_task_globs or '[]'}"
+                )
+
+        new_jobs[jid] = {**job, "tasks": filtered_tasks}
+
+    return {**config, "jobs": new_jobs}
 
 
 def resolve_interpreter(config):
@@ -101,7 +243,6 @@ except Exception:
             ret_val = payload
 
     return {"stdout": stdout, "stderr": proc.stderr or "", "return_value": ret_val, "returncode": 0}
-
 
 
 def _venv_env_for(interpreter_path: str):
@@ -218,10 +359,25 @@ def run_all_jobs(config, dry_run=False):
 def validate_config(config):
     assert "jobs" in config, "Missing 'jobs' key"
     for job_id, job in config["jobs"].items():
-        assert "tasks" in job, f"Missing tasks in job {job_id}"
+        assert "tasks" in job and isinstance(job["tasks"], list), f"Missing or invalid tasks in job {job_id}"
+        ids = [t.get("id") for t in job["tasks"]]
+        assert len(ids) == len(set(ids)), f"Duplicate task ids in job {job_id}"
+        task_map = {t["id"]: t for t in job["tasks"]}
         for task in job["tasks"]:
             assert "id" in task, f"Missing task id in job {job_id}"
-            assert "type" in task, f"Missing task type in {task['id']}"
+            assert "type" in task, f"Missing task type in {task.get('id')}"
+            ttype = task["type"]
+            if ttype == "shell":
+                assert "command" in task and isinstance(task["command"], str), f"shell task {task['id']} missing 'command'"
+            elif ttype == "script":
+                assert "path" in task, f"script task {task['id']} missing 'path'"
+            elif ttype == "function":
+                assert "path" in task, f"function task {task['id']} missing 'path' (module:function)"
+            else:
+                raise AssertionError(f"Unknown task type: {ttype} (task {task['id']})")
+            for dep in task.get("depends_on", []) or []:
+                assert dep in task_map, f"Task {task['id']} depends on unknown task '{dep}' in job {job_id}"
+    # (Optional) add a cycle check here
 
 
 def load_config():
@@ -240,8 +396,10 @@ def load_config():
     with open(cfg_path) as f:
         return json.load(f)
 
+
 def _is_windows():
     return platform.system().lower().startswith("win")
+
 
 def _find_project_python(project_dir: Path) -> Path | None:
     for name in ("python.exe", "python"):
@@ -249,6 +407,7 @@ def _find_project_python(project_dir: Path) -> Path | None:
             if p.parent.name in ("Scripts", "bin"):
                 return p
     return None
+
 
 def _fallback_system_python() -> Path | None:
     if _is_windows():
@@ -266,6 +425,7 @@ def _fallback_system_python() -> Path | None:
         if exe:
             return Path(exe)
     return None
+
 
 def _ensure_real_python(interpreter: Path | str | None, project_dir: Path) -> Path:
     if interpreter:
@@ -299,43 +459,223 @@ def init_config():
     print("Initialized dagrunner.json")
 
 
+def build_parser() -> argparse.ArgumentParser:
+    desc = "DAGRunner - Python-based DAG runner"
+    epilog = (
+        "Examples:\n"
+        "  # show all help including subcommands\n"
+        "  python dagrunner.py --help-all\n\n"
+        "  # run only two tasks in one job\n"
+        "  python dagrunner.py run -j fetching_scripts_and_executing_pipelines \\\n"
+        "      -t fetching_from_wsif_thaioil_prod_44 -t fetching_from_wsif_thaioil\n\n"
+        "  # same via glob\n"
+        "  python dagrunner.py run -j fetching_scripts_and_executing_pipelines \\\n"
+        "      --task-glob 'fetching_from_wsif_*'\n\n"
+        "  # preview the selection (no execution)\n"
+        "  python dagrunner.py list -j fetching_scripts_and_executing_pipelines \\\n"
+        "      --task-glob 'fetching_from_wsif_*'\n"
+    )
+
+    parser = argparse.ArgumentParser(
+        prog="dagrunner.py",
+        description=desc,
+        epilog=epilog,
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+
+    # Global “print everything” helper
+    parser.add_argument(
+        "--help-all",
+        action="store_true",
+        help="Show help for the main command and all subcommands, then exit.",
+    )
+
+    subparsers = parser.add_subparsers(
+        title="commands",
+        dest="command",
+        required=True,
+    )
+
+    # ---------------------------
+    # run
+    # ---------------------------
+    run_parser = subparsers.add_parser(
+        "run",
+        help="Run jobs (optionally filtered by job/task).",
+        description="Run jobs with optional job/task filtering and dependency handling.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    run_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Parse and resolve, but do not execute tasks.",
+    )
+    run_parser.add_argument(
+        "-j", "--job",
+        dest="jobs",
+        action="append",
+        help="Job ID to run (repeatable, or comma-separated). If omitted, all jobs run.",
+    )
+    run_parser.add_argument(
+        "-t", "--task",
+        dest="tasks",
+        action="append",
+        help="Task ID to include (repeatable, or comma-separated). Applies to selected jobs.",
+    )
+    run_parser.add_argument(
+        "--task-glob",
+        dest="task_globs",
+        action="append",
+        help="fnmatch-style pattern for task IDs to include (repeatable).",
+    )
+    run_parser.add_argument(
+        "--exclude-task",
+        dest="exclude_tasks",
+        action="append",
+        help="Task ID to exclude (repeatable, or comma-separated).",
+    )
+    run_parser.add_argument(
+        "--exclude-task-glob",
+        dest="exclude_task_globs",
+        action="append",
+        help="fnmatch-style pattern for task IDs to exclude (repeatable).",
+    )
+    run_parser.add_argument(
+        "--no-deps",
+        action="store_true",
+        help="Do not auto-include transitive dependencies of selected tasks.",
+    )
+
+    # ---------------------------
+    # validate
+    # ---------------------------
+    validate_parser = subparsers.add_parser(
+        "validate",
+        help="Validate DAG config.",
+        description="Validate the DAG configuration and fail fast on structural issues.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+
+    # ---------------------------
+    # list
+    # ---------------------------
+    list_parser = subparsers.add_parser(
+        "list",
+        help="List jobs/tasks (supports the same filters as 'run').",
+        description="List jobs and tasks after applying the same filters as 'run' (no execution).",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    # Reuse the same selection flags so 'list' previews exactly what would run.
+    list_parser.add_argument(
+        "-j", "--job",
+        dest="jobs",
+        action="append",
+        help="Job ID to show (repeatable, or comma-separated). If omitted, all jobs are shown.",
+    )
+    list_parser.add_argument(
+        "-t", "--task",
+        dest="tasks",
+        action="append",
+        help="Task ID to include (repeatable, or comma-separated).",
+    )
+    list_parser.add_argument(
+        "--task-glob",
+        dest="task_globs",
+        action="append",
+        help="fnmatch-style pattern for task IDs to include (repeatable).",
+    )
+    list_parser.add_argument(
+        "--exclude-task",
+        dest="exclude_tasks",
+        action="append",
+        help="Task ID to exclude (repeatable, or comma-separated).",
+    )
+    list_parser.add_argument(
+        "--exclude-task-glob",
+        dest="exclude_task_globs",
+        action="append",
+        help="fnmatch-style pattern for task IDs to exclude (repeatable).",
+    )
+    list_parser.add_argument(
+        "--no-deps",
+        action="store_true",
+        help="Do not auto-include dependencies when previewing selection.",
+    )
+
+    # ---------------------------
+    # init
+    # ---------------------------
+    subparsers.add_parser(
+        "init",
+        help="Initialize a basic dagrunner.json.",
+        description="Create a minimal dagrunner.json in the current directory.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+
+    return parser
+
+
 def main():
-    parser = argparse.ArgumentParser(description="DAGRunner - Python-based DAG runner")
-    subparsers = parser.add_subparsers(dest="command")
+    parser = build_parser()
 
-    run_parser = subparsers.add_parser("run", help="Run all jobs")
-    run_parser.add_argument("--dry-run", action="store_true", help="Dry run - show what would be executed")
+    # Support --help-all regardless of subcommands.
+    # We parse only known args first to catch --help-all without errors on missing subcommand.
+    if "--help-all" in sys.argv:
+        # Print main help
+        parser.print_help()
+        print("\n\n# Subcommand help\n")
 
-    subparsers.add_parser("validate", help="Validate DAG config")
-    subparsers.add_parser("list", help="List all jobs and tasks")
-    subparsers.add_parser("init", help="Initialize a basic dagrunner.json")
+        # Print each subparser's help
+        subparsers_action = next(
+            a for a in parser._actions
+            if isinstance(a, argparse._SubParsersAction)  # type: ignore[attr-defined]
+        )
+        for name, sp in subparsers_action.choices.items():
+            print(f"\n## {name}\n")
+            sp.print_help()
+        sys.exit(0)
 
     args = parser.parse_args()
 
-    if not args.command:
-        parser.print_help()
-        return
-
-    if args.command == "init":
-        init_config()
-        return
-
-    config = load_config()
-
     if args.command == "run":
+        config = load_config()
+        try:
+            validate_config(config)
+        except AssertionError as e:
+            raise SystemExit(f"Validation error ❌: {e}")
+        
+        try:
+            config = _filter_config_by_args(config, args)
+        except KeyError as e:
+            raise SystemExit(str(e))
+        
         run_all_jobs(config, dry_run=args.dry_run)
+
     elif args.command == "validate":
         try:
+            config = load_config()
             validate_config(config)
             print("dagrunner.json is valid ✅")
         except AssertionError as e:
             print(f"Validation error ❌: {e}")
-    elif args.command == "list":
-        for job_id, job in config.get("jobs", {}).items():
-            print(f"Job: {job_id}")
-            for task in job.get("tasks", []):
-                print(f"  - {task['id']} ({task['type']})")
 
+    elif args.command == "list":
+        config = load_config()
+        try:
+            config = _filter_config_by_args(config, args)
+        except Exception:
+            pass
+        for job_id, job in (config.get("jobs") or {}).items():
+            print(f"Job: {job_id}")
+            for t in job.get("tasks", []):
+                print(f"  - {t['id']} ({t['type']})")
+
+    elif args.command == "init":
+        init_config()
+
+    else:
+        parser.print_help()
+        sys.exit(2)
 
 if __name__ == '__main__':
     multiprocessing.freeze_support()
