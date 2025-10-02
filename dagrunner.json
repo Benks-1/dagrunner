@@ -43,6 +43,50 @@
           "depends_on": ["func_with_args_kwargs"]
         }
       ]
+    },
+    "test_job2": {
+      "id": "test_job",
+      "tasks": [
+        {
+          "id": "shell_hello",
+          "type": "shell",
+          "command": "echo [shell] hello from shell task"
+        },
+        {
+          "id": "script_hello",
+          "type": "script",
+          "path": "tests/scripts/hello.py",
+          "depends_on": ["shell_hello"]
+        },
+        {
+          "id": "func_plain",
+          "type": "function",
+          "path": "tests.mypkg.entry.say_hello",
+          "depends_on": ["script_hello"]
+        },
+        {
+          "id": "func_with_args",
+          "type": "function",
+          "path": "tests.mypkg.entry.add",
+          "args": [40],
+          "kwargs": {"b": 2},
+          "depends_on": ["func_plain"]
+        },
+        {
+          "id": "func_with_args_kwargs",
+          "type": "function",
+          "path": "tests.mypkg.entry.echo_args_kwargs",
+          "args": [1, 2, 3],
+          "kwargs": {"x": "alpha", "y": 99},
+          "depends_on": ["func_with_args"]
+        },
+        {
+          "id": "func_stderr",
+          "type": "function",
+          "path": "tests.mypkg.entry.noisy",
+          "depends_on": ["func_with_args_kwargs"]
+        }
+      ]
     }
   }
 }

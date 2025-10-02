@@ -91,24 +91,24 @@ def _dependency_closure(start_ids: Set[str], task_map: Dict[str, Dict[str, Any]]
 
 
 def _filter_config_by_args(config: Dict[str, Any], args) -> Dict[str, Any]:
-    """
-    Returns a new config dict filtered by --job/--task/--glob/--exclude-* flags.
-    This function *always* includes dependencies unless --no-deps is given.
-    """
     jobs = config.get("jobs", {})
     if not jobs:
         return config
 
     # 1) Filter jobs
     job_ids = list(jobs.keys())
-    selected_jobs = job_ids
+    explicitly_selected_jobs = []
     if getattr(args, "jobs", None):
-        requested = _normalize_id_list(args.jobs)
-        unknown = [j for j in requested if j not in jobs]
+        explicitly_selected_jobs = _normalize_id_list(args.jobs)
+        unknown = [j for j in explicitly_selected_jobs if j not in jobs]
         if unknown:
             hint = difflib.get_close_matches(unknown[0], job_ids, n=5)
-            raise SystemExit(f"Unknown job: {unknown[0]}. Did you mean: {', '.join(hint) if hint else 'no close matches'}")
-        selected_jobs = requested
+            raise SystemExit(
+                f"Unknown job: {unknown[0]}. Did you mean: {', '.join(hint) if hint else 'no close matches'}"
+            )
+        selected_jobs = explicitly_selected_jobs
+    else:
+        selected_jobs = job_ids  # all jobs when none specified
 
     # Gather task filters
     include_tasks = _normalize_id_list(getattr(args, "tasks", None))
@@ -122,11 +122,22 @@ def _filter_config_by_args(config: Dict[str, Any], args) -> Dict[str, Any]:
         job = jobs[jid]
         tasks = job.get("tasks", [])
         if not tasks:
-            continue
+            # no tasks at all -> keep job only if no includes were requested
+            if include_tasks or include_task_globs:
+                # drop silently if job was not explicitly requested; error if it was
+                if explicitly_selected_jobs:
+                    raise SystemExit(
+                        f"No tasks available in explicitly selected job '{jid}'."
+                    )
+                continue
+            else:
+                new_jobs[jid] = job
+                continue
+
         task_ids = [t["id"] for t in tasks]
         task_map = _index_tasks(tasks)
 
-        # 2) Select tasks
+        # 2) Select tasks for this job
         selected_task_ids = _select_task_ids(
             task_ids,
             include_tasks,
@@ -139,17 +150,36 @@ def _filter_config_by_args(config: Dict[str, Any], args) -> Dict[str, Any]:
         if with_deps and selected_task_ids:
             selected_task_ids = _dependency_closure(selected_task_ids, task_map)
 
-        # 4) Keep order, filter to chosen set
-        filtered_tasks = [t for t in tasks if t["id"] in selected_task_ids]
+        # 4) Keep original order, filter to chosen set
+        filtered_tasks = [t for t in tasks if t["id"] in selected_task_ids] if (include_tasks or include_task_globs or exclude_tasks or exclude_task_globs) else tasks
 
-        if include_tasks or include_task_globs:
-            if not filtered_tasks:
+        # --- CHANGED behavior ---
+        # If includes were provided and nothing matched:
+        #   - If the job was explicitly specified via -j/--job, error.
+        #   - Otherwise (implicit "all jobs"), silently DROP this job.
+        if (include_tasks or include_task_globs) and not filtered_tasks:
+            if explicitly_selected_jobs and jid in explicitly_selected_jobs:
                 raise SystemExit(
-                    f"No tasks matched selection in job '{jid}'. "
+                    f"No tasks matched selection in explicitly selected job '{jid}'. "
                     f"Requested IDs: {include_tasks or '[]'}, globs: {include_task_globs or '[]'}"
                 )
+            # drop job silently
+            continue
+        # --- end CHANGED ---
 
-        new_jobs[jid] = {**job, "tasks": filtered_tasks}
+        # Only add the job if it has any tasks after filtering
+        if filtered_tasks:
+            new_jobs[jid] = {**job, "tasks": filtered_tasks}
+
+    if not new_jobs:
+        # Helpful overall message
+        inc_ids = include_tasks or []
+        inc_globs = include_task_globs or []
+        j_hint = f" among jobs: {', '.join(selected_jobs)}" if selected_jobs else ""
+        raise SystemExit(
+            f"No jobs/tasks matched the selection{j_hint}. "
+            f"Requested task IDs: {inc_ids or '[]'}, globs: {inc_globs or '[]'}"
+        )
 
     return {**config, "jobs": new_jobs}
 
