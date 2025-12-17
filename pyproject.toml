@@ -3,9 +3,12 @@ name = "dagrunner"
 version = "0.1.0"
 description = "Lightweight local DAG runner"
 readme = "README.md"
+license = { text = "MIT" }
+authors = [ { name = "Benks-1" } ]
 
 [project.scripts]
-dag = "dagrunner:main"
+# Official CLI entrypoint so `pip install -e .` provides `dagrunner` command
+dagrunner = "dagrunner:main"
 
 [build-system]
 requires = ["setuptools"]
