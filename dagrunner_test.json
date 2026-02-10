@@ -1,0 +1,10 @@
+{
+  "jobs": {
+    "test_job": {
+      "id": "test_job",
+      "tasks": [
+        {"id": "shell_hello", "type": "shell", "command": "echo [file] hello from shell"}
+      ]
+    }
+  }
+}

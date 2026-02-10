@@ -19,3 +19,13 @@ def noisy():
     print("[mypkg.entry.noisy] normal print to STDOUT")
     print("[mypkg.entry.noisy] simulated warning on STDERR", file=sys.stderr)
     return "done"
+
+
+def consume(value):
+    """Consume a value (used to test placeholder passing)."""
+    print(f"[mypkg.entry.consume] got value: {value}")
+    # If numeric, double it
+    try:
+        return value * 2
+    except Exception:
+        return {"received": value}
