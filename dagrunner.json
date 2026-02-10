@@ -11,41 +11,47 @@
         {
           "id": "script_hello",
           "type": "script",
-          "path": "tests/scripts/hello.py",
-          "depends_on": ["shell_hello"]
+          "path": "tests/scripts/hello.py"
         },
         {
           "id": "func_plain",
           "type": "function",
-          "path": "tests.mypkg.entry.say_hello",
-          "depends_on": ["script_hello"]
+          "path": "tests.mypkg.entry.say_hello"
         },
         {
           "id": "func_with_args",
           "type": "function",
           "path": "tests.mypkg.entry.add",
-          "args": [40],
-          "kwargs": {"b": 2},
-          "depends_on": ["func_plain"]
+          "args": [
+            40
+          ],
+          "kwargs": {
+            "b": 2
+          }
         },
         {
           "id": "func_with_args_kwargs",
           "type": "function",
           "path": "tests.mypkg.entry.echo_args_kwargs",
-          "args": [1, 2, 3],
-          "kwargs": {"x": "alpha", "y": 99},
-          "depends_on": ["func_with_args"]
+          "args": [
+            1,
+            2,
+            3
+          ],
+          "kwargs": {
+            "x": "alpha",
+            "y": 99
+          }
         },
         {
           "id": "func_stderr",
           "type": "function",
-          "path": "tests.mypkg.entry.noisy",
-          "depends_on": ["func_with_args_kwargs"]
+          "path": "tests.mypkg.entry.noisy"
         }
       ]
     },
     "test_job2": {
-      "id": "test_job",
+      "id": "test_job2",
       "tasks": [
         {
           "id": "shell_hello",
@@ -56,35 +62,61 @@
           "id": "script_hello",
           "type": "script",
           "path": "tests/scripts/hello.py",
-          "depends_on": ["shell_hello"]
+          "depends_on": [
+            "shell_hello",
+            "shell_hello"
+          ]
         },
         {
           "id": "func_plain",
           "type": "function",
           "path": "tests.mypkg.entry.say_hello",
-          "depends_on": ["script_hello"]
+          "depends_on": [
+            "script_hello",
+            "script_hello"
+          ]
         },
         {
           "id": "func_with_args",
           "type": "function",
           "path": "tests.mypkg.entry.add",
-          "args": [40],
-          "kwargs": {"b": 2},
-          "depends_on": ["func_plain"]
+          "args": [
+            40
+          ],
+          "kwargs": {
+            "b": 2
+          },
+          "depends_on": [
+            "func_plain",
+            "func_plain"
+          ]
         },
         {
           "id": "func_with_args_kwargs",
           "type": "function",
           "path": "tests.mypkg.entry.echo_args_kwargs",
-          "args": [1, 2, 3],
-          "kwargs": {"x": "alpha", "y": 99},
-          "depends_on": ["func_with_args"]
+          "args": [
+            1,
+            2,
+            3
+          ],
+          "kwargs": {
+            "x": "alpha",
+            "y": 99
+          },
+          "depends_on": [
+            "func_with_args",
+            "func_with_args"
+          ]
         },
         {
           "id": "func_stderr",
           "type": "function",
           "path": "tests.mypkg.entry.noisy",
-          "depends_on": ["func_with_args_kwargs"]
+          "depends_on": [
+            "func_with_args_kwargs",
+            "func_with_args_kwargs"
+          ]
         }
       ]
     }

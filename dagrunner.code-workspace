@@ -1,0 +1,18 @@
+{
+	"folders": [
+		{
+			"path": "."
+		}
+	],
+	"settings": {
+		"cSpell.words": [
+			"lemmatization",
+			"symspellpy"
+		],
+		"files.exclude": {
+			".git": false
+		},
+		"python.defaultInterpreterPath": "C:\\PythonEnvironments\\pyinstaller\\Scripts\\python.exe"
+	}
+}
+
