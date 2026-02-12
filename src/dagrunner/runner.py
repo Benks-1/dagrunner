@@ -203,7 +203,10 @@ def _filter_config_by_args(config: Dict[str, Any], args) -> Dict[str, Any]:
 
 def resolve_interpreter(config):
     if config.get("interpreter"):
-        return Path(config["interpreter"])
+        p = Path(config["interpreter"])
+        if p.exists():
+            return p
+        # ignore non-existent explicit interpreters and continue searching
 
     for p in Path.cwd().rglob("python.exe"):
         return p
@@ -216,7 +219,11 @@ def resolve_interpreter(config):
             content = json.loads(f.read_text())
             interp = content.get("settings", {}).get("python.defaultInterpreterPath")
             if interp:
-                return Path(interp)
+                p = Path(interp)
+                if p.exists():
+                    return p
+                # if the workspace setting points to a non-existent interpreter,
+                # ignore it and fall back to other discovery methods
         except Exception:
             continue
 
@@ -505,9 +512,12 @@ def run_task(task, interpreter, logf, dry_run=False):
             return {"returncode": rc, "stdout": out, "stderr": err, "return_value": None}
 
     except Exception as e:
+        import traceback as _tb
         end = time.time()
+        tb = _tb.format_exc()
         logf.write(f"Status: failed\nError: {e}\nDuration: {round(end - start, 2)}s\n")
-        return {"returncode": 1, "stdout": "", "stderr": str(e), "return_value": None}
+        logf.write(f"TRACEBACK:\n{tb}\n")
+        return {"returncode": 1, "stdout": "", "stderr": str(e) + "\n" + tb, "return_value": None}
 
 
 def resolve_dependencies(tasks):
@@ -687,29 +697,76 @@ def _ensure_real_python(interpreter: Path | str | None, project_dir: Path) -> Pa
 
 
 def init_config(path: str | None = None):
-    base_config = {
-        "jobs": {
-            "example_job": {
-                "id": "example_job",
-                "tasks": [
-                    {"id": "task1", "type": "shell", "command": "echo 'Hello World'"},
-                    {"id": "task2", "type": "script", "path": "scripts/example.py", "depends_on": ["task1"]},
-                    {"id": "task3", "type": "function", "path": "my_module.entry.main", "depends_on": ["task2"], "args": ["value1"], "kwargs": {"arg2": "value2"}}
-                ]
+    # Use the example config shipped inside the package. We deliberately do NOT
+    # copy the schema file into the user's project. The example config contains
+    # a $schema reference pointing to './dagrunner.schema.json' so editors can
+    # still pick up a schema if the file is available in the project.
+    example_path = Path(__file__).resolve().parent / "example_dagrunner.json"
+    try:
+        base_config = json.loads(example_path.read_text())
+    except Exception:
+        # Fallback to a minimal inline example if the bundled example is missing
+        base_config = {
+            "$schema": "./dagrunner.schema.json",
+            "jobs": {
+                "example_job": {
+                    "id": "example_job",
+                    "tasks": [
+                        {"id": "task1", "type": "shell", "command": "echo 'Hello World'"}
+                    ]
+                }
             }
         }
-    }
+
     if path:
         p = Path(path)
         # Ensure parent exists
         if not p.parent.exists():
             p.parent.mkdir(parents=True, exist_ok=True)
+        # write config
         with open(p, "w") as f:
             json.dump(base_config, f, indent=2)
+        # Attempt to copy the packaged schema into the same folder so editors
+        # get automatic validation when the user opens the newly created file.
+        try:
+            pkg_schema = Path(__file__).resolve().parent / "dagrunner.schema.json"
+            if not pkg_schema.exists() and hasattr(sys, '_MEIPASS'):
+                # PyInstaller: try to locate the bundled file inside _MEIPASS
+                meipass = Path(sys._MEIPASS)
+                cand1 = meipass / "dagrunner.schema.json"
+                cand2 = meipass / "dagrunner" / "dagrunner.schema.json"
+                if cand1.exists():
+                    pkg_schema = cand1
+                elif cand2.exists():
+                    pkg_schema = cand2
+            if pkg_schema.exists():
+                dest = p.parent / "dagrunner.schema.json"
+                dest.write_text(pkg_schema.read_text())
+        except Exception:
+            pass
+
         print(f"Initialized dagrunner config at: {p}")
     else:
-        with open("dagrunner.json", "w") as f:
+        cfg_path = Path("dagrunner.json")
+        with open(cfg_path, "w") as f:
             json.dump(base_config, f, indent=2)
+        # same copy behavior for default location
+        try:
+            pkg_schema = Path(__file__).resolve().parent / "dagrunner.schema.json"
+            if not pkg_schema.exists() and hasattr(sys, '_MEIPASS'):
+                meipass = Path(sys._MEIPASS) # type: ignore
+                cand1 = meipass / "dagrunner.schema.json"
+                cand2 = meipass / "dagrunner" / "dagrunner.schema.json"
+                if cand1.exists():
+                    pkg_schema = cand1
+                elif cand2.exists():
+                    pkg_schema = cand2
+            if pkg_schema.exists():
+                dest = Path.cwd() / "dagrunner.schema.json"
+                dest.write_text(pkg_schema.read_text())
+        except Exception:
+            pass
+
         print("Initialized dagrunner.json")
 
 

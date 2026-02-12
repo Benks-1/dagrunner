@@ -1,0 +1,50 @@
+{
+  "$schema": "./dagrunner.schema.json",
+  "jobs": {
+    "test_job": {
+      "id": "test_job",
+      "tasks": [
+        { "id": "shell_hello", "type": "shell", "command": "echo [shell] hello from shell task" },
+        { "id": "script_hello", "type": "script", "path": "tests/scripts/hello.py" },
+        { "id": "func_plain", "type": "function", "path": "tests.mypkg.entry.say_hello" },
+        { "id": "func_with_args", "type": "function", "path": "tests.mypkg.entry.add", "args": [40], "kwargs": { "b": 2 } },
+        { "id": "func_with_args_kwargs", "type": "function", "path": "tests.mypkg.entry.echo_args_kwargs", "args": [1, 2, 3], "kwargs": { "x": "alpha", "y": 99 } },
+        { "id": "func_stderr", "type": "function", "path": "tests.mypkg.entry.noisy" },
+        { "id": "use_in_function", "type": "function", "path": "tests.mypkg.entry.consume", "args": ["${outputs.func_with_args.return_value}"], "depends_on": ["func_with_args"] },
+        { "id": "use_in_shell", "type": "shell", "command": "echo [shell] consumed=${outputs.func_with_args.return_value}", "depends_on": ["func_with_args"] }
+      ]
+    },
+    "example": {
+      "id": "example",
+      "tasks": [
+        { "id": "producer", "type": "function", "path": "demo_tasks.produce_data" },
+        { "id": "consumer_args", "type": "function", "path": "demo_tasks.consume_args", "args": ["${outputs.producer.return_value}"], "depends_on": ["producer"] },
+        { "id": "consumer_kwargs_exact", "type": "function", "path": "demo_tasks.consume_kwargs", "kwargs": { "payload": "${outputs.producer.return_value}" }, "depends_on": ["producer"] },
+        { "id": "consumer_kw_field", "type": "function", "path": "demo_tasks.show_token", "kwargs": { "token": "${outputs.producer.return_value.token}" }, "depends_on": ["producer"] },
+        { "id": "consumer_embedded", "type": "function", "path": "demo_tasks.print_msg", "kwargs": { "msg": "got ${outputs.producer.return_value.token}" }, "depends_on": ["producer"] }
+      ]
+    },
+    "j1": {
+      "id": "j1",
+      "tasks": [
+        { "id": "t1", "type": "function", "path": "demo_tasks.fail" },
+        { "id": "t2", "type": "function", "path": "demo_tasks.ok", "depends_on": ["t1"] }
+      ]
+    },
+    "j2": {
+      "id": "j2",
+      "tasks": [
+        { "id": "t1", "type": "function", "path": "demo_tasks.fail" },
+        { "id": "t2", "type": "function", "path": "demo_tasks.ok", "args": ["${outputs.t1.return_value}"], "depends_on": ["t1"] }
+      ]
+    },
+    "parallel_a": {
+      "id": "parallel_a",
+      "tasks": [ { "id": "pa1", "type": "shell", "command": "echo [parallel_a] one" } ]
+    },
+    "parallel_b": {
+      "id": "parallel_b",
+      "tasks": [ { "id": "pb1", "type": "shell", "command": "echo [parallel_b] two" } ]
+    }
+  }
+}

@@ -1,0 +1,57 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "DAGRunner configuration schema",
+  "type": "object",
+  "properties": {
+    "$schema": { "type": "string" },
+    "interpreter": { "type": "string", "description": "Optional path to Python interpreter" },
+    "jobs": {
+      "type": "object",
+      "description": "Mapping of job id to job definition",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["id", "tasks"],
+        "properties": {
+          "id": { "type": "string" },
+          "tasks": {
+            "type": "array",
+            "items": { "$ref": "#/definitions/task" }
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": ["jobs"],
+  "additionalProperties": false,
+  "definitions": {
+    "task": {
+      "type": "object",
+      "required": ["id", "type"],
+      "properties": {
+        "id": { "type": "string" },
+        "type": { "type": "string", "enum": ["shell", "script", "function"] },
+        "command": { "type": "string", "description": "Shell command for shell tasks" },
+        "path": { "type": "string", "description": "Script or function path" },
+        "args": { "type": "array", "description": "Positional args passed to functions/scripts" },
+        "kwargs": { "type": "object", "description": "Keyword args passed to functions/scripts" },
+        "depends_on": { "type": "array", "items": { "type": "string" }, "description": "List of task ids this task depends on" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "type": { "const": "shell" } } },
+          "then": { "required": ["command"] }
+        },
+        {
+          "if": { "properties": { "type": { "const": "script" } } },
+          "then": { "required": ["path"] }
+        },
+        {
+          "if": { "properties": { "type": { "const": "function" } } },
+          "then": { "required": ["path"] }
+        }
+      ],
+      "additionalProperties": false
+    }
+  }
+}
