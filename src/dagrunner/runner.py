@@ -529,9 +529,12 @@ def run_task(task, interpreter, logf, dry_run=False):
             return {"returncode": rc, "stdout": out, "stderr": err, "return_value": None}
 
     except Exception as e:
+        import traceback as _tb
         end = time.time()
+        tb = _tb.format_exc()
         logf.write(f"Status: failed\nError: {e}\nDuration: {round(end - start, 2)}s\n")
-        return {"returncode": 1, "stdout": "", "stderr": str(e), "return_value": None}
+        logf.write(f"TRACEBACK:\n{tb}\n")
+        return {"returncode": 1, "stdout": "", "stderr": str(e) + "\n" + tb, "return_value": None}
 
 
 def resolve_dependencies(tasks):
