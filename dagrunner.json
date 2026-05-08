@@ -1,4 +1,5 @@
 {
+  "$schema": "./dagrunner.schema.json",
   "jobs": {
     "test_job": {
       "id": "test_job",

@@ -18,6 +18,22 @@ class TestInitAndLoadFile(unittest.TestCase):
             data = json.loads(target.read_text())
             self.assertIn("jobs", data)
 
+    def test_init_writes_schema_alongside_config(self):
+        with tempfile.TemporaryDirectory() as td:
+            target = Path(td) / "dagrunner.json"
+            runner.init_config(str(target))
+            schema_path = Path(td) / "dagrunner.schema.json"
+            self.assertTrue(schema_path.exists(), "dagrunner.schema.json should be written next to dagrunner.json")
+            schema = json.loads(schema_path.read_text())
+            self.assertIn("$defs", schema)
+
+    def test_init_config_links_schema(self):
+        with tempfile.TemporaryDirectory() as td:
+            target = Path(td) / "dagrunner.json"
+            runner.init_config(str(target))
+            data = json.loads(target.read_text())
+            self.assertEqual(data.get("$schema"), "./dagrunner.schema.json")
+
     def test_load_config_with_file_sets_cwd(self):
         oldcwd = os.getcwd()
         with tempfile.TemporaryDirectory() as td:

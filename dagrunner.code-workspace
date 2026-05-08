@@ -2,6 +2,9 @@
 	"folders": [
 		{
 			"path": "."
+		},
+		{
+			"path": "D:\\Client Projects\\2026_03_05_TENAZ_SIFPRO_TO_SIS_MIGRATION"
 		}
 	],
 	"settings": {
@@ -12,6 +15,6 @@
 		"files.exclude": {
 			".git": false
 		},
-		"python.defaultInterpreterPath": "C:\\PythonEnvironments\\pyinstaller\\Scripts\\python.exe"
+		"python.defaultInterpreterPath": "D:\\Enironments\\Python\\Venvs\\pyinstaller\\Scripts\\python.exe"
 	}
 }

@@ -1,0 +1,138 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Task Runner Job Definition Schema",
+  "type": "object",
+
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "description": "Optional: schema reference for editor tooling (e.g., VS Code).",
+      "readOnly": true
+    },
+
+    "interpreter": {
+      "type": "string",
+      "description": "Explicit Python interpreter path. Overrides all auto-detection (local venv, .code-workspace, system Python)."
+    },
+
+    "jobs": {
+      "type": "object",
+      "description": "A dictionary of job definitions (keys are job names).",
+
+      "patternProperties": {
+        ".*": {
+          "type": "object",
+          "description": "A job definition.",
+
+          "properties": {
+            "id": {
+              "type": "string",
+              "description": "Unique job ID."
+            },
+
+            "tasks": {
+              "type": "array",
+              "description": "List of tasks in this job.",
+              "items": {
+                "$ref": "#/$defs/task"
+              }
+            }
+          },
+
+          "required": ["id", "tasks"],
+          "additionalProperties": false
+        }
+      },
+
+      "additionalProperties": false
+    }
+  },
+
+  "required": ["jobs"],
+  "additionalProperties": false,
+
+  "$defs": {
+    "task": {
+      "type": "object",
+      "description": "A runnable task.",
+
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique task ID."
+        },
+
+        "type": {
+          "type": "string",
+          "enum": ["shell", "script", "function"],
+          "description": "Task execution type."
+        },
+
+        "command": {
+          "type": "string",
+          "description": "Shell command to execute (only for type=shell)."
+        },
+
+        "path": {
+          "type": "string",
+          "description": "File path or function dotted-path (for script/function types)."
+        },
+
+        "args": {
+          "type": "array",
+          "description": "Positional arguments (any JSON values allowed).",
+          "items": {}
+        },
+
+        "kwargs": {
+          "type": "object",
+          "description": "Keyword arguments (free-form key/value).",
+          "additionalProperties": true
+        },
+
+        "depends_on": {
+          "type": "array",
+          "description": "Other tasks that must run before this one (by task id).",
+          "items": { "type": "string" }
+        }
+      },
+
+      "required": ["id", "type"],
+
+      "allOf": [
+        {
+          "if": {
+            "properties": { "type": { "const": "shell" } },
+            "required": ["type"]
+          },
+          "then": {
+            "required": ["command"],
+            "not": { "required": ["path"] }
+          }
+        },
+        {
+          "if": {
+            "properties": { "type": { "const": "script" } },
+            "required": ["type"]
+          },
+          "then": {
+            "required": ["path"],
+            "not": { "required": ["command"] }
+          }
+        },
+        {
+          "if": {
+            "properties": { "type": { "const": "function" } },
+            "required": ["type"]
+          },
+          "then": {
+            "required": ["path"],
+            "not": { "required": ["command"] }
+          }
+        }
+      ],
+
+      "additionalProperties": false
+    }
+  }
+}

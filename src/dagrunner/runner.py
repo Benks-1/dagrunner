@@ -11,10 +11,12 @@ import time
 import multiprocessing
 from pathlib import Path
 from datetime import datetime
+import io
+import concurrent.futures
 import platform, shutil
 import fnmatch
 import re
-from typing import Iterable, Sequence, Set, Dict, Any
+from typing import Iterable, NamedTuple, Optional, Sequence, Set, Dict, Any
 import difflib
 
 
@@ -31,6 +33,12 @@ def _quote_token_for_shell(token: object) -> str:
 
 
 LOG_DIR = Path.cwd()
+
+
+class InterpreterInfo(NamedTuple):
+    path: Path
+    source: str
+    configured: Optional[Path] = None
 
 
 def _index_tasks(tasks: Sequence[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
@@ -201,26 +209,42 @@ def _filter_config_by_args(config: Dict[str, Any], args) -> Dict[str, Any]:
     return {**config, "jobs": new_jobs}
 
 
-def resolve_interpreter(config):
-    if config.get("interpreter"):
-        return Path(config["interpreter"])
+def resolve_interpreter(config) -> "InterpreterInfo":
+    configured_fallback: Optional[Path] = None
 
+    # 1. Explicit path in dagrunner.json 'interpreter' field
+    if config.get("interpreter"):
+        p = Path(config["interpreter"])
+        if p.exists():
+            return InterpreterInfo(path=p, source="dagrunner.json 'interpreter' field")
+        configured_fallback = p  # remember bad path for fallback log
+
+    # 2. Local venv inside project dir (rglob for python.exe / python)
     for p in Path.cwd().rglob("python.exe"):
-        return p
+        return InterpreterInfo(path=p, source="local venv (project rglob)", configured=configured_fallback)
     for p in Path.cwd().rglob("python"):
         if p.is_file() and os.access(p, os.X_OK):
-            return p
+            return InterpreterInfo(path=p, source="local venv (project rglob)", configured=configured_fallback)
 
+    # 3. .code-workspace 'python.defaultInterpreterPath'
     for f in Path.cwd().glob("*.code-workspace"):
         try:
             content = json.loads(f.read_text())
             interp = content.get("settings", {}).get("python.defaultInterpreterPath")
             if interp:
-                return Path(interp)
+                ws_p = Path(interp)
+                if ws_p.exists():
+                    return InterpreterInfo(path=ws_p, source=".code-workspace 'python.defaultInterpreterPath'", configured=configured_fallback)
         except Exception:
             continue
 
-    return Path(sys.executable)
+    # 4. System Python fallback
+    fb = _find_project_python(Path.cwd()) or _fallback_system_python()
+    if fb:
+        return InterpreterInfo(path=fb, source="system Python (fallback)", configured=configured_fallback)
+
+    # 5. sys.executable last resort (frozen exe or bare install)
+    return InterpreterInfo(path=Path(sys.executable), source="frozen executable fallback", configured=configured_fallback)
 
 
 _PLACEHOLDER_RE = re.compile(r"\$\{outputs\.([A-Za-z0-9_\-]+)\.([A-Za-z0-9_\.]+)\}")
@@ -529,36 +553,109 @@ def resolve_dependencies(tasks):
     return resolved
 
 
+def _compute_waves(tasks: list) -> list:
+    """Group tasks into sequential waves where all tasks within a wave are
+    independent (none depends on another in the same wave) and can run concurrently."""
+    task_ids = {t["id"] for t in tasks}
+    completed: Set[str] = set()
+    waves = []
+    remaining = list(tasks)
+
+    while remaining:
+        wave = [
+            t for t in remaining
+            if all(d in completed or d not in task_ids for d in (t.get("depends_on") or []))
+        ]
+        if not wave:
+            wave = remaining[:]  # cycle guard — should not happen after validate_config
+            remaining = []
+        else:
+            wave_ids = {t["id"] for t in wave}
+            remaining = [t for t in remaining if t["id"] not in wave_ids]
+        completed.update(t["id"] for t in wave)
+        waves.append(wave)
+
+    return waves
+
+
+def _exec_task_buffered(task, interpreter_path, dry_run):
+    """Run a single task and capture its log output; used for parallel wave execution."""
+    buf = io.StringIO()
+    result = run_task(task, interpreter_path, buf, dry_run=dry_run)
+    return task["id"], result, buf.getvalue()
+
+
 def run_job(job_id, job, interpreter, timestamp, dry_run=False, ignore_deps=False):
     log_path = LOG_DIR / f"dagrunner_{timestamp}_{job_id}.log"
+    # Accept InterpreterInfo or a plain Path/str (backward compat)
+    if isinstance(interpreter, InterpreterInfo):
+        interp_info = interpreter
+    else:
+        interp_info = InterpreterInfo(
+            path=Path(interpreter) if interpreter else Path(sys.executable),
+            source="(passed directly)",
+        )
     with open(log_path, "w") as logf:
-        logf.write(f"Interpreter: {interpreter}\n")
+        # Interpreter origin block
+        if interp_info.configured is not None:
+            logf.write(f"Configured  : {interp_info.configured}  [NOT FOUND - fell back]\n")
+        logf.write(f"Interpreter : {interp_info.path}\n")
+        logf.write(f"Source      : {interp_info.source}\n")
+        logf.write(f"Exists      : {'yes' if interp_info.path.exists() else 'NO - interpreter missing!'}\n")
         logf.write(f"Job: {job_id}\nStart: {datetime.now()}\n")
-        tasks = resolve_dependencies(job["tasks"])
+        waves = _compute_waves(job["tasks"])
         task_outputs: Dict[str, Dict[str, Any]] = {}
-        for task in tasks:
-            # Resolve placeholders in the task using previous outputs
-            try:
-                task = resolve_placeholders(task, task_outputs)
-            except Exception as e:
-                logf.write(f"Placeholder resolution error for task {task.get('id')}: {e}\n")
-            # Check dependencies: if any dependency failed, skip this task (unless ignore_deps)
-            deps = task.get("depends_on", []) or []
-            if deps and not ignore_deps:
-                failed = [d for d in deps if task_outputs.get(d, {}).get("returncode", 0) != 0]
-                if failed:
-                    logf.write(f"--- Task {task['id']} ---\n")
-                    logf.write(f"Status: skipped\nReason: failed dependencies: {failed}\n")
-                    task_outputs[task["id"]] = {"returncode": 2, "stdout": "", "stderr": "skipped due to failed dependency", "return_value": None}
-                    continue
 
-            result = run_task(task, interpreter, logf, dry_run=dry_run)
-            # store result for later placeholders
-            tid = task.get("id")
-            if isinstance(result, dict):
-                task_outputs[tid] = result
+        for wave in waves:
+            # 1. Resolve placeholders — all deps come from previous waves so outputs are complete
+            resolved_wave = []
+            for task in wave:
+                try:
+                    task = resolve_placeholders(task, task_outputs)
+                except Exception as e:
+                    logf.write(f"Placeholder resolution error for task {task.get('id')}: {e}\n")
+                resolved_wave.append(task)
+
+            # 2. Skip tasks whose dependencies failed
+            runnable = []
+            for task in resolved_wave:
+                deps = task.get("depends_on", []) or []
+                if deps and not ignore_deps:
+                    failed = [d for d in deps if task_outputs.get(d, {}).get("returncode", 0) != 0]
+                    if failed:
+                        logf.write(f"--- Task {task['id']} ---\n")
+                        logf.write(f"Status: skipped\nReason: failed dependencies: {failed}\n")
+                        task_outputs[task["id"]] = {"returncode": 2, "stdout": "", "stderr": "skipped due to failed dependency", "return_value": None}
+                        continue
+                runnable.append(task)
+
+            if not runnable:
+                continue
+
+            # 3a. Single task — run inline (no thread overhead)
+            if len(runnable) == 1:
+                result = run_task(runnable[0], interp_info.path, logf, dry_run=dry_run)
+                tid = runnable[0]["id"]
+                task_outputs[tid] = result if isinstance(result, dict) else {"returncode": 1, "stdout": "", "stderr": "unknown result", "return_value": None}
+
+            # 3b. Multiple independent tasks — run in parallel threads
             else:
-                task_outputs[tid] = {"returncode": 1, "stdout": "", "stderr": "unknown result", "return_value": None}
+                logf.write(f"[parallel: {', '.join(t['id'] for t in runnable)}]\n")
+                wave_results: Dict[str, tuple] = {}
+                with concurrent.futures.ThreadPoolExecutor(max_workers=len(runnable)) as executor:
+                    futures = {
+                        executor.submit(_exec_task_buffered, t, interp_info.path, dry_run): t["id"]
+                        for t in runnable
+                    }
+                    for future in concurrent.futures.as_completed(futures):
+                        tid, result, log_text = future.result()
+                        wave_results[tid] = (result, log_text)
+                # Write logs in deterministic wave order
+                for task in runnable:
+                    tid = task["id"]
+                    result, log_text = wave_results[tid]
+                    logf.write(log_text)
+                    task_outputs[tid] = result if isinstance(result, dict) else {"returncode": 1, "stdout": "", "stderr": "unknown result", "return_value": None}
 
         logf.write(f"Job: {job_id} complete\n")
 
@@ -675,7 +772,7 @@ def _ensure_real_python(interpreter: Path | str | None, project_dir: Path) -> Pa
 
     if interpreter:
         ip = Path(interpreter)
-        if "python" in ip.name.lower():
+        if "python" in ip.name.lower() and ip.exists():
             return ip
     py = _find_project_python(project_dir) or _fallback_system_python()
     if py:
@@ -688,6 +785,7 @@ def _ensure_real_python(interpreter: Path | str | None, project_dir: Path) -> Pa
 
 def init_config(path: str | None = None):
     base_config = {
+        "$schema": "./dagrunner.schema.json",
         "jobs": {
             "example_job": {
                 "id": "example_job",
@@ -699,18 +797,39 @@ def init_config(path: str | None = None):
             }
         }
     }
+
+    # Determine output directory and JSON path
     if path:
         p = Path(path)
-        # Ensure parent exists
         if not p.parent.exists():
             p.parent.mkdir(parents=True, exist_ok=True)
-        with open(p, "w") as f:
-            json.dump(base_config, f, indent=2)
-        print(f"Initialized dagrunner config at: {p}")
+        out_dir = p.parent
+        json_path = p
     else:
-        with open("dagrunner.json", "w") as f:
-            json.dump(base_config, f, indent=2)
-        print("Initialized dagrunner.json")
+        out_dir = Path(".")
+        json_path = Path("dagrunner.json")
+
+    with open(json_path, "w") as f:
+        json.dump(base_config, f, indent=2)
+    print(f"Initialized dagrunner config at: {json_path.resolve()}")
+
+    # Write schema alongside the config.
+    # Locate the bundled schema: next to this file in development, or in
+    # sys._MEIPASS when running as a frozen PyInstaller exe.
+    schema_path = out_dir / "dagrunner.schema.json"
+    try:
+        candidates = [
+            Path(__file__).parent / "dagrunner.schema.json",
+            Path(getattr(sys, "_MEIPASS", "")) / "dagrunner.schema.json",
+        ]
+        schema_source = next((c for c in candidates if c.is_file()), None)
+        if schema_source:
+            schema_path.write_bytes(schema_source.read_bytes())
+            print(f"Schema written at:              {schema_path.resolve()}")
+        else:
+            print("Warning: bundled dagrunner.schema.json not found; schema not written.")
+    except Exception as e:
+        print(f"Warning: could not write schema file ({e})")
 
 
 def build_parser() -> argparse.ArgumentParser:

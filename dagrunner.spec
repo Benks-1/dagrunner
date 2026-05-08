@@ -5,7 +5,7 @@ a = Analysis(
     ['cli_entry.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=[('src/dagrunner/dagrunner.schema.json', '.')],  # '.' = _MEIPASS root, avoids namespace-package collision
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
